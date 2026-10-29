@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<!--
+  Configuração do Hive Metastore.
+  A conexão com o Postgres (URL, usuário e senha) é passada pelo
+  docker-compose.yml via SERVICE_OPTS, a partir do .env: nada de segredo aqui.
+-->
+<configuration>
+  <!-- Diretório padrão para bancos criados sem LOCATION explícito -->
+  <property>
+    <name>metastore.warehouse.dir</name>
+    <value>s3a://warehouse/</value>
+  </property>
+
+  <!-- Porta Thrift onde Spark (e depois o Thrift Server/dbt) se conectam -->
+  <property>
+    <name>metastore.thrift.port</name>
+    <value>9083</value>
+  </property>
+
+  <!-- O schema do catálogo é criado/atualizado pelo schematool no entrypoint -->
+  <property>
+    <name>metastore.schema.verification</name>
+    <value>true</value>
+  </property>
+</configuration>

@@ -1,0 +1,191 @@
+# =============================================================================
+# triple-double — stack local (etapa 1: storage, catálogo e processamento)
+#
+#   MinIO ──────────────┐
+#     (bronze/silver/   │  s3a://
+#      gold/warehouse)  │
+#                       ├── Spark master + worker ──thrift──┐
+#   Postgres ── Hive Metastore ◄────────────────────────────┘
+#
+# Próximas etapas adicionam: Spark Thrift Server, Airflow e Superset.
+# Variáveis vêm do .env (copie de .env.example). Suba com `make up`.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-triple-double}
+
+# Credenciais do MinIO repassadas como variáveis AWS_* para todo serviço que
+# acessa o object storage via S3A (Hive Metastore e Spark).
+x-s3-credentials: &s3-credentials
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: us-east-1
+
+services:
+  # ---------------------------------------------------------------------------
+  # MinIO: object storage compatível com S3; é o "disco" do lakehouse.
+  # Guarda o dado cru da bronze e as tabelas Delta da silver e da gold.
+  # Console web em http://localhost:9001 (login com MINIO_ROOT_USER/PASSWORD).
+  #
+  # Imagem compilada do código-fonte em docker/minio: o MinIO deixou de
+  # publicar imagens da edição community em 2025 (detalhes no Dockerfile).
+  # ---------------------------------------------------------------------------
+  minio:
+    build: ./docker/minio
+    image: triple-double/minio:2025-10-15
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # minio-init: job de execução única que cria os buckets das camadas do
+  # medalhão (bronze, silver, gold) e o warehouse padrão do catálogo.
+  # Usa o cliente `mc` incluído na imagem do MinIO. É idempotente
+  # (--ignore-existing): pode rodar a cada `make up` sem efeito colateral.
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: triple-double/minio:2025-10-15
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      for bucket in bronze silver gold warehouse; do
+        mc mb --ignore-existing local/$${bucket};
+      done
+      "
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Postgres: banco relacional onde o Hive Metastore persiste o catálogo
+  # (bancos, tabelas, schemas, localização dos arquivos no MinIO).
+  # Não guarda dados do pipeline, só metadados.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Hive Metastore: catálogo central do lakehouse. Mapeia nomes de tabelas
+  # (ex.: silver.player_season) para os arquivos Delta no MinIO, permitindo que
+  # Spark, dbt e Superset enxerguem as mesmas tabelas. Serviço Thrift na 9083.
+  #
+  # No primeiro start, o entrypoint roda o schematool, que cria (ou atualiza)
+  # as tabelas internas do catálogo no Postgres; nos starts seguintes, nada muda.
+  # Imagem customizada em docker/hive-metastore (driver JDBC + conector S3A).
+  # ---------------------------------------------------------------------------
+  hive-metastore:
+    build: ./docker/hive-metastore
+    image: triple-double/hive-metastore:4.0.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-credentials
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      # Conexão JDBC com o Postgres, montada a partir do .env
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+        -Djavax.jdo.option.ConnectionUserName=${POSTGRES_USER}
+        -Djavax.jdo.option.ConnectionPassword=${POSTGRES_PASSWORD}
+    ports:
+      - "${HIVE_METASTORE_PORT:-9083}:9083"
+    healthcheck:
+      # Saudável quando a porta Thrift aceita conexões
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Spark master: coordenador do cluster standalone. Recebe as aplicações
+  # (jobs PySpark bronze → silver) e distribui as tarefas entre os workers.
+  # UI em http://localhost:8080.
+  #
+  # Imagem customizada em docker/spark (Delta Lake + conector S3A +
+  # spark-defaults.conf apontando para MinIO e Hive Metastore). A mesma imagem
+  # é usada pelo worker, garantindo versões idênticas de JARs no cluster.
+  # ---------------------------------------------------------------------------
+  spark-master:
+    build: ./docker/spark
+    image: triple-double/spark:3.5.3
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host spark-master --port 7077 --webui-port 8080
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      <<: *s3-credentials
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/spark-master/7077'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Spark worker: executa de fato as tarefas (executors) enviadas pelo master.
+  # Cores e memória vêm do .env (SPARK_WORKER_CORES / SPARK_WORKER_MEMORY).
+  # Precisa das credenciais S3 porque os executors leem e escrevem no MinIO.
+  # UI em http://localhost:8081.
+  # ---------------------------------------------------------------------------
+  spark-worker:
+    build: ./docker/spark  # mesma imagem do master (reaproveita o cache do build)
+    image: triple-double/spark:3.5.3
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --webui-port 8081
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *s3-credentials
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-8g}
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8081}:8081"
+    restart: unless-stopped
+
+# Volumes nomeados: os dados sobrevivem a `make down` (só somem com `down -v`)
+volumes:
+  minio-data:
+  postgres-data:

@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!--
+  Configuração do conector S3A para o metastore acessar o MinIO.
+  As credenciais vêm das variáveis AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
+  definidas no docker-compose.yml a partir do .env.
+-->
+<configuration>
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://minio:9000</value>
+  </property>
+  <!-- MinIO usa endereçamento por caminho (http://host/bucket), não por subdomínio -->
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>fs.s3a.aws.credentials.provider</name>
+    <value>com.amazonaws.auth.EnvironmentVariableCredentialsProvider</value>
+  </property>
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+</configuration>
