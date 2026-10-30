@@ -32,7 +32,7 @@ O projeto deve ser **legível, reproduzível e bem documentado**: qualidade de c
 |---|---|
 | Object storage | MinIO (compatível com S3) |
 | Formato de tabela | Delta Lake |
-| Catálogo | Hive Metastore (backend Postgres) |
+| Catálogo | Hive Metastore 3.1.3 (backend Postgres). Não usar 4.x: o Spark 3.5 não é compatível com o Metastore 4 (ver `docs/adr/001-hive-metastore-version.md`) |
 | Processamento | PySpark 3.5 (Spark master + worker + Thrift Server) |
 | Transformação silver → gold | dbt (`dbt-spark`, conexão via Thrift) |
 | Orquestração | Apache Airflow |

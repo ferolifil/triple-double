@@ -98,13 +98,15 @@ services:
   # (ex.: silver.player_season) para os arquivos Delta no MinIO, permitindo que
   # Spark, dbt e Superset enxerguem as mesmas tabelas. Serviço Thrift na 9083.
   #
-  # No primeiro start, o entrypoint roda o schematool, que cria (ou atualiza)
-  # as tabelas internas do catálogo no Postgres; nos starts seguintes, nada muda.
+  # No primeiro start, o entrypoint roda o schematool, que cria as tabelas
+  # internas do catálogo no Postgres; nos starts seguintes, detecta o schema
+  # existente e pula essa etapa.
   # Imagem customizada em docker/hive-metastore (driver JDBC + conector S3A).
+  # Versão 3.1.3 por compatibilidade com o Spark 3.5 (docs/adr/001).
   # ---------------------------------------------------------------------------
   hive-metastore:
     build: ./docker/hive-metastore
-    image: triple-double/hive-metastore:4.0.1
+    image: triple-double/hive-metastore:3.1.3
     depends_on:
       postgres:
         condition: service_healthy
